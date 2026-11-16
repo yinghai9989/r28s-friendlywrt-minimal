@@ -315,6 +315,29 @@ jobs:
           sudo apt-get install -y dwarves binutils libelf-dev
           pahole --version
 
+      - name: Skip external rtw88 on R28S
+        if: inputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT/project"
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          path = Path("scripts/sd-fuse/build-kernel.sh")
+          script = path.read_text()
+          start_marker = "    # build rtw_8822ce wifi driver\n"
+          end_marker = "    # build usb wifi driver\n"
+          if script.count(start_marker) != 1 or script.count(end_marker) != 1:
+              raise SystemExit("sd-fuse layout changed; inspect build-kernel.sh")
+          start = script.index(start_marker)
+          end = script.index(end_marker, start)
+          block = script[start:end]
+          if 'github.com/lwfinger/rtw88' not in block or '(cd rtw88/' not in block:
+              raise SystemExit("Unexpected rtw88 block; inspect build-kernel.sh")
+          path.write_text(script[:start] + script[end:])
+          PYTHON
+          bash -n scripts/sd-fuse/build-kernel.sh
+
       - name: Build U-Boot and kernel
         if: inputs.mode == 'full'
         run: |
