@@ -1,0 +1,507 @@
+name: Build R28S FriendlyWrt 25.12 Minimal with BTF
+
+# =============================================================================
+#  为 NanoPi R28S (RK3528) 构建 FriendlyWrt 25.12 极简 non-docker TF 卡镜像
+#
+#  本 workflow 完全复现 friendlyarm 官方两段式构建链：
+#    源码  : friendlyarm/friendlywrt_manifests @ master-v25.12, rk3528.xml
+#    内核  : friendlyarm/kernel-rockchip   @ nanopi6-v6.1.y
+#    U-Boot: friendlyarm/uboot-rockchip    @ nanopi5-v2017.09 (nanopi_zero2_defconfig)
+#    rootfs: friendlyarm/friendlywrt       @ master-v25.12 (rockchip / non-docker)
+#    打包  : friendlyarm/sd-fuse_rk3528    @ kernel-6.1.y
+#
+#  极简配置：在编译 rootfs 之前，用 scripts/minimalize-configs.sh
+#  就地裁剪 configs/rockchip/ ，剔除与 R28S 无关的组件。
+#
+#  触发方式：Actions 页面 → Run workflow，选择模式
+#    dry-run : 只同步源码 + 生成并静态检查 .config（约 20~35 分钟，不出镜像）
+#    full    : 完整编译并产出镜像（约 2~4 小时）
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry-run = 仅生成并检查 .config；full = 完整编译并出镜像'
+        required: true
+        default: 'dry-run'
+        type: choice
+        options:
+          - dry-run
+          - full
+      kernel:
+        description: "vendor-6.1 uses FriendlyELEC upstream; port-6.12 requires your RK3528 port"
+        type: choice
+        options: [vendor-6.1, port-6.12]
+        default: vendor-6.1
+      kernel_url:
+        description: "Public HTTPS Git repository for the FriendlyELEC-compatible 6.12 port"
+        type: string
+      kernel_commit:
+        description: "Full 40-character commit SHA for the 6.12 port"
+        type: string
+      kernel_config:
+        description: "Space-separated 6.12 defconfig and optional config fragment targets"
+        default: nanopi5_linux_defconfig friendlywrt.config
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  MANIFEST_URL: https://github.com/friendlyarm/friendlywrt_manifests
+  MANIFEST_BRANCH: master-v25.12
+  MANIFEST_FILE: rk3528.xml
+  DIST_DIRNAME: friendlywrt25
+  IMG_NAME: R28S-FriendlyWrt-25.12-Minimal.img
+  RELEASE_TAG: r28s-minimal-25.12
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate kernel selection
+        env:
+          KERNEL_MODE: ${{ inputs.kernel }}
+          PORT_URL: ${{ inputs.kernel_url }}
+          PORT_COMMIT: ${{ inputs.kernel_commit }}
+          PORT_CONFIG: ${{ inputs.kernel_config }}
+        run: |
+          set -euo pipefail
+          if [[ "$KERNEL_MODE" == port-6.12 ]]; then
+            [[ "$PORT_URL" =~ ^https://[^[:space:]]+$ ]] || {
+              echo "::error::Enter the public HTTPS URL of a FriendlyELEC-compatible 6.12 kernel port"
+              exit 1
+            }
+            [[ "$PORT_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::Enter a full lowercase kernel commit SHA"
+              exit 1
+            }
+            [[ "$PORT_CONFIG" =~ ^[a-zA-Z0-9_.-]+([[:blank:]][a-zA-Z0-9_.-]+)*$ ]] || {
+              echo "::error::Enter valid kernel configuration targets"
+              exit 1
+            }
+            series=6.12
+          else
+            series=6.1
+          fi
+          echo "KERNEL_SERIES=$series" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=r28s-minimal-25.12-${series}-btf" >> "$GITHUB_ENV"
+          echo "IMG_NAME=R28S-FriendlyWrt-25.12-Minimal-${series}-BTF.img" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      - name: 0. 环境信息
+        run: |
+          echo "核心数 : $(nproc)"
+          echo "内存   : $(free -h | awk 'NR==2{print $2}')"
+          echo "触发器 : ${{ github.actor }}"
+          echo "模式   : ${{ inputs.mode }}"
+          echo "--- 磁盘 ---"
+          df -h
+          # 记录任务开始时间戳，供报告计算「构建耗时」。
+          # 不要依赖 github.run_started_at：实测在步骤 env 中会取到空值。
+          echo "BUILD_START_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
+          echo "任务开始: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      # -----------------------------------------------------------------------
+      - name: 1. 选择构建目录并释放磁盘
+        run: |
+          set -eu
+          # 构建需要约 25GB；GitHub runner 的 / 分区通常只有 ~14GB，
+          # 因此优先使用空间更大的 /mnt（临时盘）。
+          MNT_FREE=$(df -Pk /mnt 2>/dev/null | awk 'NR==2{print $4}')
+          if [ -n "${MNT_FREE:-}" ] && [ "${MNT_FREE}" -gt 30000000 ]; then
+            BUILD_ROOT=/mnt/r28s-build
+            sudo mkdir -p "${BUILD_ROOT}"
+            sudo chown -R "$(id -u):$(id -g)" "${BUILD_ROOT}"
+          else
+            BUILD_ROOT="${GITHUB_WORKSPACE}/build"
+            mkdir -p "${BUILD_ROOT}"
+          fi
+          echo "BUILD_ROOT=${BUILD_ROOT}" >> "$GITHUB_ENV"
+          echo "选用构建目录: ${BUILD_ROOT}"
+
+          # 释放根分区空间（与官方 CI 相同的清理项）
+          sudo swapoff -a || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc 2>/dev/null || true
+          sudo rm -rf /usr/local/lib/android 2>/dev/null || true
+
+          df -h "${BUILD_ROOT}" /
+          echo "可用空间检查: $(df -Pk "${BUILD_ROOT}" | awk 'NR==2{print $4}') KB"
+
+      # -----------------------------------------------------------------------
+      - name: 2. 检出本仓库（携带裁剪脚本）
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: 3. 安装编译环境（官方 build-env-on-ubuntu-bionic）
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          sudo rm -rf /etc/apt/sources.list.d
+          wget -q https://raw.githubusercontent.com/friendlyarm/build-env-on-ubuntu-bionic/master/install.sh -O /tmp/build-env.sh
+          # 与官方 CI 相同的四处改写：跳过 openjdk 与 fa-toolchain
+          sed -i -e 's/^apt-get -y install openjdk-8-jdk/# apt-get -y install openjdk-8-jdk/' /tmp/build-env.sh
+          sed -i -e 's/^\[ -d fa-toolchain \]/# [ -d fa-toolchain ]/' /tmp/build-env.sh
+          sed -i -e 's/^(cat fa-toolchain/# (cat fa-toolchain/' /tmp/build-env.sh
+          sed -i -e 's/^(tar xf fa-toolchain/# (tar xf fa-toolchain/' /tmp/build-env.sh
+          sudo -E bash /tmp/build-env.sh
+          git config --global user.name  'GitHub Actions'
+          git config --global user.email 'noreply@github.com'
+          git config --global color.ui false
+          git clone --depth 1 https://github.com/friendlyarm/repo
+          sudo cp -f repo/repo /usr/bin/repo
+          sudo chmod +x /usr/bin/repo
+          repo --version | head -2 || true
+
+      # -----------------------------------------------------------------------
+      - name: 4. repo init（rk3528.xml @ master-v25.12）
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}"
+          mkdir -p project && cd project
+          repo init --depth=1 \
+            -u "${MANIFEST_URL}" \
+            -b "${MANIFEST_BRANCH}" \
+            -m "${MANIFEST_FILE}" \
+            --repo-url=https://github.com/friendlyarm/repo \
+            --no-clone-bundle
+
+      # -----------------------------------------------------------------------
+      - name: 5. repo sync（kernel / u-boot / rkbin / friendlywrt / configs / device / scripts / toolchain）
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          repo sync -c --no-clone-bundle -j"$(nproc)" \
+            kernel u-boot rkbin \
+            friendlywrt \
+            configs \
+            device/common device/friendlyelec \
+            scripts scripts/sd-fuse \
+            toolchain
+          echo "--- 目录结构 ---"
+          ls -la
+          echo "--- 磁盘占用 ---"
+          du -sh . 2>/dev/null || true
+          df -h "${BUILD_ROOT}"
+
+      # -----------------------------------------------------------------------
+      - name: Select kernel and apply R28S build configuration
+        env:
+          KERNEL_MODE: ${{ inputs.kernel }}
+          PORT_URL: ${{ inputs.kernel_url }}
+          PORT_COMMIT: ${{ inputs.kernel_commit }}
+          PORT_CONFIG: ${{ inputs.kernel_config }}
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT/project"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          repo manifest -r > "$GITHUB_WORKSPACE/dist/friendlyelec-manifest.xml"
+          if [[ "$KERNEL_MODE" == port-6.12 ]]; then
+            mv kernel kernel-vendor-reference
+            git init -q kernel
+            git -C kernel fetch --no-tags --depth=1 "$PORT_URL" "$PORT_COMMIT"
+            git -C kernel checkout --detach FETCH_HEAD
+            [[ "$(git -C kernel rev-parse HEAD)" == "$PORT_COMMIT" ]]
+          fi
+
+          kernel_version=$(make -s -C kernel kernelversion)
+          [[ "$kernel_version" == "$KERNEL_SERIES".* ]] || {
+            echo "::error::Kernel version $kernel_version does not match $KERNEL_SERIES.y"
+            exit 1
+          }
+
+          {
+            printf 'kernel_version=%s\n' "$kernel_version"
+            printf 'kernel_commit=%s\n' "$(git -C kernel rev-parse HEAD)"
+            printf 'kernel_mode=%s\n' "$KERNEL_MODE"
+          } > "$GITHUB_WORKSPACE/dist/kernel-source.txt"
+
+          cat > .current_config.mk <<EOF
+          . device/friendlyelec/rk3528/base.mk
+          TARGET_IMAGE_DIRNAME=$DIST_DIRNAME
+          TARGET_FRIENDLYWRT_CONFIG=rockchip
+          TARGET_SD_RAW_FILENAME=$IMG_NAME
+          EOF
+          if [[ "$KERNEL_MODE" == port-6.12 ]]; then
+            printf 'TARGET_KERNEL_CONFIG="%s"\n' "$PORT_CONFIG" >> .current_config.mk
+          fi
+          cat >> .current_config.mk <<'EOF'
+          TARGET_KERNEL_CONFIG="${TARGET_KERNEL_CONFIG} r28s-btf.config"
+          EOF
+
+          # sd-fuse runs distclean before applying KCFG. Keep BTF in a Kconfig fragment.
+          cat > kernel/arch/arm64/configs/r28s-btf.config <<'EOF'
+          CONFIG_DEBUG_INFO_DWARF4=y
+          # CONFIG_DEBUG_INFO_REDUCED is not set
+          CONFIG_DEBUG_INFO_BTF=y
+          CONFIG_BPF_SYSCALL=y
+          CONFIG_BPF_JIT=y
+          CONFIG_CGROUPS=y
+          CONFIG_CGROUP_BPF=y
+          EOF
+          if [[ "$KERNEL_MODE" == port-6.12 ]]; then
+            cat >> kernel/arch/arm64/configs/r28s-btf.config <<'EOF'
+          CONFIG_NET_NS=y
+          CONFIG_NET_SCHED=y
+          CONFIG_NET_CLS_ACT=y
+          CONFIG_NET_SCH_INGRESS=y
+          CONFIG_NET_CLS_BPF=y
+          CONFIG_VETH=y
+          CONFIG_NF_CONNTRACK=y
+          CONFIG_NF_TABLES=y
+          CONFIG_NF_TABLES_INET=y
+          CONFIG_NFT_CT=y
+          CONFIG_NFT_QUEUE=y
+          CONFIG_NETFILTER_NETLINK_QUEUE=y
+          EOF
+          fi
+          cp kernel/arch/arm64/configs/r28s-btf.config "$GITHUB_WORKSPACE/dist/"
+
+      - name: 6. 记录源码版本（写入报告）
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          {
+            echo "### 源码版本（本次构建实际使用的 commit）"
+            echo ""
+            echo "| 组件 | 路径 | 分支 | commit |"
+            echo "|---|---|---|---|"
+            for d in friendlywrt kernel u-boot rkbin configs device/friendlyelec device/common scripts scripts/sd-fuse toolchain; do
+              if git -C "${d}" rev-parse --verify HEAD >/dev/null 2>&1; then
+                br=$(git -C "${d}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "-")
+                sha=$(git -C "${d}" rev-parse --short HEAD 2>/dev/null || echo "-")
+                echo "| ${d} | \`${d}\` | ${br} | \`${sha}\` |"
+              fi
+            done
+          } > "${BUILD_ROOT}/source-versions.md"
+          cat "${BUILD_ROOT}/source-versions.md"
+
+      # -----------------------------------------------------------------------
+      - name: 7. 应用极简配置裁剪
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          bash "${GITHUB_WORKSPACE}/scripts/minimalize-configs.sh" configs/rockchip
+
+      # -----------------------------------------------------------------------
+      - name: 8. 生成 .config（DEBUG_DOT_CONFIG=1，仅生成不编译）
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          echo "--- .current_config.mk ---"
+          cat .current_config.mk
+          echo "------------------------------------------------------------"
+          DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+          echo "------------------------------------------------------------"
+          echo ".config 行数: $(wc -l < friendlywrt/.config)"
+
+      # -----------------------------------------------------------------------
+      - name: 9. 静态检查 .config
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          bash "${GITHUB_WORKSPACE}/scripts/check-config.sh" friendlywrt/.config \
+            | tee "${BUILD_ROOT}/static-check.txt"
+
+      # -----------------------------------------------------------------------
+      - name: Install BTF build tools
+        if: inputs.mode == 'full'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dwarves binutils libelf-dev
+          pahole --version
+
+      - name: Build U-Boot and kernel
+        if: inputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT/project"
+          ./build.sh uboot 2>&1 | tee "$BUILD_ROOT/uboot-build.log"
+          ./build.sh kernel 2>&1 | tee "$BUILD_ROOT/kernel-build.log"
+
+      - name: Verify kernel BTF and FriendlyELEC image inputs
+        if: inputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT/project"
+          cp kernel/.config "$GITHUB_WORKSPACE/dist/kernel.config"
+          grep -qx 'CONFIG_DEBUG_INFO_BTF=y' kernel/.config
+          readelf -SW kernel/vmlinux > "$GITHUB_WORKSPACE/dist/vmlinux-sections.txt"
+          grep -E '[[:space:]]\.BTF[[:space:]]' "$GITHUB_WORKSPACE/dist/vmlinux-sections.txt"
+          for image in kernel.img resource.img; do
+            test -s "kernel/$image" || {
+              echo "::error::The kernel port must generate $image for FriendlyELEC sd-fuse"
+              exit 1
+            }
+          done
+
+      - name: Build FriendlyWrt rootfs and TF card image
+        if: inputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT/project"
+          ./build.sh friendlywrt 2>&1 | tee "$BUILD_ROOT/friendlywrt-build.log"
+          ./build.sh sd-img 2>&1 | tee "$BUILD_ROOT/sd-image-build.log"
+
+      # -----------------------------------------------------------------------
+      # 11a 是关键步骤：把镜像产物复制进 dist/，保证无论如何都能交付。
+      # 11b 只负责生成报告，允许失败（continue-on-error），绝不拖垮产物。
+      # -----------------------------------------------------------------------
+      - name: 11a. 收集镜像产物（关键，保证产物落地）
+        if: inputs.mode == 'full'
+        run: |
+          set -eu
+          DIST="${GITHUB_WORKSPACE}/dist"
+          OUT_DIR="${BUILD_ROOT}/project/out"
+          mkdir -p "${DIST}"
+          echo "--- 构建输出目录 out/ ---"
+          ls -la "${OUT_DIR}" || true
+
+          # 注意：out 是符号链接（-> scripts/sd-fuse/out），find 默认不跟随符号链接，
+          # 必须解析出真实目录（readlink -f）或加 -L，否则会误报"未找到产物"。
+          REAL_OUT="$(readlink -f "${OUT_DIR}" 2>/dev/null || echo "${OUT_DIR}")"
+          echo "out 真实路径: ${REAL_OUT}"
+          ls -la "${REAL_OUT}" || true
+
+          # 定位 .img.gz（out/ 内由官方 sd-fuse 的 mk-sd-image.sh 生成）
+          IMG_GZ="${REAL_OUT}/${IMG_NAME}.gz"
+          if [ -z "${IMG_GZ}" ] || [ ! -f "${IMG_GZ}" ]; then
+            echo "ERROR: out/ 内未找到 .img.gz 产物" >&2
+            echo "已搜索目录: ${REAL_OUT}" >&2
+            find -L "${REAL_OUT}" -name '*.img*' 2>/dev/null | head -20 >&2 || true
+            exit 1
+          fi
+          echo "选中镜像: ${IMG_GZ}"
+
+          cp -f "${IMG_GZ}" "${DIST}/${IMG_NAME}.gz"
+          gzip -t "${DIST}/${IMG_NAME}.gz"
+          ( cd "${DIST}" && sha256sum "${IMG_NAME}.gz" > "${IMG_NAME}.gz.sha256" )
+          echo "校验值:"
+          cat "${DIST}/${IMG_NAME}.gz.sha256"
+
+          # 保证 REPORT.md 存在（11b 若失败也不影响 Release 的 body_path）
+          if [ ! -f "${DIST}/REPORT.md" ]; then
+            {
+              echo "# R28S FriendlyWrt 25.12 Minimal — 构建报告"
+              echo ""
+              echo "> 报告生成步骤未完成，但镜像产物已成功收集，见附件。"
+              echo ""
+              echo "- 镜像文件：\`${IMG_NAME}.gz\`"
+              echo "- 校验值见 \`${IMG_NAME}.gz.sha256\`"
+            } > "${DIST}/REPORT.md"
+          fi
+
+          echo "--- dist/ ---"
+          ls -la "${DIST}"
+
+      # -----------------------------------------------------------------------
+      - name: 11b. 生成详细报告（best-effort，失败不影响产物交付）
+        if: inputs.mode == 'full'
+        continue-on-error: true
+        env:
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          set -eu
+          cd "${BUILD_ROOT}/project"
+          bash "${GITHUB_WORKSPACE}/scripts/make-report.sh" \
+            "${BUILD_ROOT}" \
+            "${GITHUB_WORKSPACE}/dist" \
+            || echo "WARN: 报告生成失败（镜像产物已由 11a 收集，不影响交付）"
+          if [ -f "${GITHUB_WORKSPACE}/dist/REPORT.md" ]; then
+            printf '\n- BTF 已通过 vmlinux 段检查。内核来源见 kernel-source.txt。\n' >> "${GITHUB_WORKSPACE}/dist/REPORT.md"
+          fi
+          echo "--- dist/ ---"
+          ls -la "${GITHUB_WORKSPACE}/dist"
+
+      # -----------------------------------------------------------------------
+      - name: 12. dry-run 产物归档（.config + 检查结果）
+        if: inputs.mode != 'full'
+        run: |
+          set -eu
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          cp -f "${BUILD_ROOT}/project/friendlywrt/.config" "${GITHUB_WORKSPACE}/dist/minimal-.config"
+          cp -f "${BUILD_ROOT}/project/configs/rockchip/"* "${GITHUB_WORKSPACE}/dist/" 2>/dev/null || true
+          cp -f "${BUILD_ROOT}/static-check.txt" "${GITHUB_WORKSPACE}/dist/static-check.txt"
+          cp -f "${BUILD_ROOT}/source-versions.md" "${GITHUB_WORKSPACE}/dist/source-versions.md"
+          # 裁剪 diff（脚本写在 /tmp）
+          [ -f /tmp/r28s-removed.txt ] && cp -f /tmp/r28s-removed.txt "${GITHUB_WORKSPACE}/dist/removed-packages.txt" || true
+          ls -la "${GITHUB_WORKSPACE}/dist"
+
+      # -----------------------------------------------------------------------
+      - name: Collect build diagnostics
+        if: always()
+        run: |
+          mkdir -p dist
+          if [[ -n "${BUILD_ROOT:-}" ]]; then
+            for log in uboot-build kernel-build friendlywrt-build sd-image-build; do
+              if [[ -f "$BUILD_ROOT/$log.log" ]]; then
+                tail -n 300 "$BUILD_ROOT/$log.log" > "dist/$log.tail.log"
+              fi
+            done
+            if [[ -f "$BUILD_ROOT/project/kernel/.config" ]]; then
+              cp "$BUILD_ROOT/project/kernel/.config" dist/kernel.config
+            fi
+          fi
+
+      - name: 13. 上传构建产物（artifact）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r28s-minimal-${{ inputs.mode }}-${{ github.run_number }}
+          # dist/ 内只放轻量产物（.img.gz 约 170MB + 文本清单）。
+          # 切勿把 3.5GB 裸 .img 放进 dist/：artifact 单文件上限会导致失败。
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      - name: 14. 发布镜像到 Release（仅 full 模式）
+        if: inputs.mode == 'full'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "R28S FriendlyWrt 25.12 Minimal + BTF (${{ env.KERNEL_SERIES }})"
+          body_path: dist/REPORT.md
+          # 清单类文件可能因报告步骤 best-effort 失败而缺失，不应因此中断发布
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.img.gz
+            dist/*.img.gz.sha256
+            dist/*.manifest
+            dist/REPORT.md
+            dist/installed-packages.txt
+            dist/removed-packages.txt
+            dist/firmware-list.txt
+            dist/static-check.txt
+            dist/kernel-source.txt
+            dist/kernel.config
+          overwrite_files: true
+
+      # -----------------------------------------------------------------------
+      - name: 15. 输出摘要到 Actions 页面
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "## R28S FriendlyWrt 25.12 Minimal — ${{ inputs.mode }} 结果"
+            echo ""
+            echo "- 运行号： #${{ github.run_number }}"
+            echo "- 触发人：${{ github.actor }}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f dist/REPORT.md ]; then
+            cat dist/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f dist/static-check.txt ]; then
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '<details><summary>静态检查明细</summary>' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat dist/static-check.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+          fi
